@@ -8,7 +8,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="公車">
-<title>新北板橋公車站 下一班</title>
+<title>下一班公車</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <style>
   :root{
@@ -42,12 +42,11 @@
   .bar{padding:10px 16px; padding-top:calc(10px + env(safe-area-inset-top,0px));
     background:var(--surface); border-bottom:1px solid var(--line);
     display:flex; align-items:center; gap:12px; flex-wrap:wrap}
-  .stopbtn{display:flex; align-items:baseline; gap:9px; background:none; border:0; padding:0;
-    cursor:pointer; color:inherit; font:inherit; text-align:left; min-width:0}
-  .stopbtn h1{margin:0; font-family:"Barlow Condensed","Noto Sans TC",sans-serif;
+  .bar h1{margin:0; font-family:"Barlow Condensed","Noto Sans TC",sans-serif;
     font-size:25px; font-weight:700; line-height:1.1; white-space:nowrap;
-    overflow:hidden; text-overflow:ellipsis}
-  .stopbtn .caret{color:var(--ink-3); font-size:12px; flex:none}
+    overflow:hidden; text-overflow:ellipsis; min-width:0}
+  #places{margin-bottom:6px}
+  #places button{font-weight:600}
   .bar .spacer{flex:1 1 auto}
   .stamp{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:12.5px;
     font-variant-numeric:tabular-nums; color:var(--ink-2); display:flex; align-items:center; gap:7px}
@@ -96,6 +95,8 @@
   .flag.warn{color:var(--signal)}
   .flag.stall{color:var(--bad)}
   .empty{padding:22px 16px; color:var(--ink-3); font-size:13px}
+  .row.missing{opacity:.55}
+  .row.missing .badge{background:var(--ink-3)}
 
   .mapwrap{position:relative; min-height:0; background:var(--map-ground); overflow:hidden}
   #map{width:100%; height:100%; display:block; touch-action:none; cursor:grab}
@@ -164,7 +165,7 @@
     fill:var(--ink-2); paint-order:stroke; stroke:var(--map-ground); stroke-width:3px; pointer-events:none}
 
   @media (max-width:620px){
-    .stopbtn h1{font-size:21px}
+    .bar h1{font-size:21px}
     .row{padding:10px 14px; gap:9px}
     .row .big{font-size:19px}
   }
@@ -173,11 +174,10 @@
 <body>
 <div class="app" id="app">
   <header class="bar">
-    <button type="button" class="stopbtn" id="stopbtn">
-      <h1 id="stopname">—</h1><span class="caret">▾ 換站</span>
-    </button>
+    <h1 id="stopname">—</h1>
     <span class="spacer"></span>
     <span class="stamp"><span class="pulse"></span><span id="stamp">連線中…</span></span>
+    <div class="dirs" id="places"></div>
     <div class="dirs" id="dirs"></div>
   </header>
 
@@ -223,7 +223,15 @@
   "use strict";
 
   // ── 設定 ──────────────────────────────────────────────────────────────
-  var HOME_STOP = '新北板橋公車站';   // 預設站名
+  // 常用站牌。match 是資料裡的站名（同一個站可能有多個名稱變體），
+  // routes 是你在這一站真的會搭的路線；留 null 表示不過濾。
+  // 標 ntpc 的是新北市轄路線，目前這個資料源沒有，會以灰列標示尚未接入。
+  var PLACES = [
+    { name:'板橋公車站', match:['新北板橋公車站','新北板橋公車站(新府路)'],
+      routes:['307','307西藏三民','577','897'], ntpc:['577','897'] },
+    { name:'國泰街口', match:['國泰街口'],
+      routes:['307','307西藏三民','265區','57','577','657'], ntpc:['57','577','657'] }
+  ];
   var BASE = 'https://tcgbusfs.blob.core.windows.net/blobbus/';
   var BUS_MS = 10000, ETA_MS = 20000;
   var STALE_S = 60;                   // 車輛回報逾時
@@ -309,30 +317,52 @@
   }
 
   // ── 狀態 ──────────────────────────────────────────────────────────────
-  var stopName = HOME_STOP, dir = '0';
+  var place = PLACES[0], plat = null;
   var cur = null, etaMap = {}, history = [], rows = [], picked = null;
   var busTimer=null, etaTimer=null, running=true, failures=0, globalMode=false;
   var showMap=false;
   try{ showMap = localStorage.getItem('busShowMap')==='1'; }catch(e){}
 
-  try{ var sv = localStorage.getItem('busStop'); if(sv) stopName = sv; }catch(e){}
+  try{
+    var sv = localStorage.getItem('busPlace');
+    if(sv){
+      var f = PLACES.filter(function(x){ return x.name===sv; })[0];
+      if(f) place = f;
+      else place = {name:sv, match:[sv], routes:null, ntpc:[]};   // 從換站挑的臨時站牌
+    }
+  }catch(e){}
 
-  function entriesFor(name, g){
-    return (stopIndex[name]||[]).filter(function(e){ return String(e.s.g)===String(g); });
-  }
-  function dirsAvailable(name){
+  // 這個站牌組底下、且在追蹤路線清單內的所有停靠
+  function placeEntries(){
     var out=[];
-    ['0','1'].forEach(function(g){ if(entriesFor(name,g).length) out.push(g); });
+    place.match.forEach(function(n){
+      (stopIndex[n]||[]).forEach(function(e){
+        if(place.routes && place.routes.indexOf(S.meta[e.rid].name)<0) return;
+        out.push(e);
+      });
+    });
     return out;
   }
-  function dirLabel(name, g){
-    var es = entriesFor(name,g), dest = {};
-    es.forEach(function(e){
-      var m=S.meta[e.rid]; dest[g==='0'?m.to:m.from]=1;
+  // 月台＝實體站位。同一根站牌上的車都往同一個方向，所以用月台分頁比用去／返正確：
+  // 同一個月台上，甲路線可能算去程、乙路線算返程，但人站的位置是同一個。
+  function platforms(){
+    var seen={}, out=[];
+    placeEntries().forEach(function(e){
+      var L=String(e.s.L);
+      var o = seen[L] || (seen[L]={L:L, dest:{}, n:0}, out.push(seen[L]), seen[L]);
+      var m=S.meta[e.rid];
+      o.dest[String(e.s.g)==='0' ? m.to : m.from]=1; o.n++;
     });
-    var names = Object.keys(dest);
-    var tail = names.length===1 ? names[0] : (names.length<=2 ? names.join('／') : names.slice(0,2).join('／')+'…');
-    return (g==='0'?'去程':'返程') + '・往 ' + tail;
+    out.sort(function(a,b){ return b.n-a.n; });
+    return out;
+  }
+  function platLabel(o){
+    var d=Object.keys(o.dest);
+    var tail = d.length<=2 ? d.join('／') : d.slice(0,2).join('／')+'…';
+    return '往 '+tail;
+  }
+  function currentEntries(){
+    return placeEntries().filter(function(e){ return String(e.s.L)===String(plat); });
   }
 
   // ── 取資料 ────────────────────────────────────────────────────────────
@@ -461,8 +491,8 @@
     rows = [];
     if(!cur) return;
 
-    entriesFor(stopName, dir).forEach(function(e){
-      var rid=e.rid, s=e.s, key=rid+'/'+s.id;
+    currentEntries().forEach(function(e){
+      var rid=e.rid, s=e.s, g=String(s.g), key=rid+'/'+s.id;
       var official = (key in etaMap) ? etaMap[key] : null;
       var officialOK = official!=null && official>=0;
       var dstop = STOPD[key];
@@ -471,8 +501,8 @@
       // 這條路線上游、同向、行駛中的車，全部撈出來由近到遠排
       var ups=[];
       cur.bus.forEach(function(b){
-        if(b.r!==rid || b.g!==String(s.g) || b.duty!=='1') return;
-        var pr = project(rid, String(s.g), b.x, b.y);
+        if(b.r!==rid || b.g!==g || b.duty!=='1') return;
+        var pr = project(rid, g, b.x, b.y);
         if(!pr || pr.off > OFFLINE_M || pr.d >= dstop) return;
         ups.push({bus:b, d:pr.d, gap:dstop-pr.d});
       });
@@ -487,7 +517,7 @@
       }
 
       if(!ups.length){
-        rows.push({rid:rid, stop:s, bus:null, eta:official, src:'official',
+        rows.push({rid:rid, stop:s, g:g, bus:null, eta:official, src:'official',
                    order:0, upstream:0, calibrated:false});
         return;
       }
@@ -497,7 +527,7 @@
       var nearArrival = officialOK && official<60 && ups[0].gap<500;
       var canPin = officialOK && (calibrated || nearArrival);
       if(officialOK && !canPin){
-        rows.push({rid:rid, stop:s, bus:null, eta:official, src:'official',
+        rows.push({rid:rid, stop:s, g:g, bus:null, eta:official, src:'official',
                    order:0, upstream:ups.length, calibrated:false, unmatched:true});
       }
 
@@ -507,17 +537,23 @@
         else { t=u.gap/(EST_KMH/3.6) + EST_BASE_S; src='est'; }
         var nleft=0;
         S.stops[rid].forEach(function(x){
-          if(String(x.g)!==String(s.g) || x.q>=s.q) return;
+          if(String(x.g)!==g || x.q>=s.q) return;
           var dx=STOPD[rid+'/'+x.id];
           if(dx!=null && dx>u.d) nleft++;
         });
-        rows.push({rid:rid, stop:s, bus:u.bus, busId:u.bus.b, gap:u.gap, bd:u.d, dstop:dstop,
+        rows.push({rid:rid, stop:s, g:g, bus:u.bus, busId:u.bus.b, gap:u.gap, bd:u.d, dstop:dstop,
                    eta:t, src:src, nleft:nleft, order:i, upstream:ups.length,
                    calibrated:calibrated, stall:stalledFor(u.bus.b)});
       });
     });
 
+    // 這個站牌組裡屬於新北市轄、目前資料源沒有的路線，明確列出來而不是靜靜消失
+    (place.ntpc||[]).forEach(function(n){
+      rows.push({rid:null, name:n, stop:null, g:null, bus:null, eta:null,
+                 src:'none', order:0, upstream:0, missing:true});
+    });
     rows.sort(function(a,b){
+      if(a.missing!==b.missing) return a.missing?1:-1;
       var av=(a.eta==null||a.eta<0)?1e9:a.eta, bv=(b.eta==null||b.eta<0)?1e9:b.eta;
       return av-bv;
     });
@@ -542,6 +578,15 @@
     }
     rows.forEach(function(r){
       var div=document.createElement('div');
+      if(r.missing){
+        div.className='row missing';
+        div.innerHTML = '<span class="badge c-other">'+r.name+'</span>'
+          + '<div class="mid"><div class="veh">新北市轄路線，這個資料源沒有</div>'
+          + '<div class="sub">要接 TDX 才拿得到</div></div>'
+          + '<div class="big dead">未接入</div>';
+        boardBox.appendChild(div);
+        return;
+      }
       div.className='row '+cc(r.rid)+(picked===r.busId&&r.busId?' picked':'');
 
       var v=r.eta, cls='big', txt;
@@ -620,8 +665,8 @@
   }
   // 取出「來車位置 → 站牌」之間那一段線型（含兩端精確點）
   function corridor(r){
-    var pts = S.shapes[r.rid] && S.shapes[r.rid][String(dir)];
-    var L = LINE[r.rid+'/'+dir];
+    var pts = S.shapes[r.rid] && S.shapes[r.rid][r.g];
+    var L = LINE[r.rid+'/'+r.g];
     if(!pts || !L || r.bd==null) return [];
     var out = [[r.bus.x, r.bus.y]];
     for(var i=0;i<pts.length;i++){
@@ -680,7 +725,7 @@
         gR.appendChild(el('path',{d:d, class:'route '+cc(r.rid), 'stroke-width':(3.6*k).toFixed(2)}));
         // 沿途還沒到的站，畫成小點，跟「還有 N 站」對得起來
         S.stops[r.rid].forEach(function(x){
-          if(String(x.g)!==String(dir) || x.q>=r.stop.q) return;
+          if(String(x.g)!==r.g || x.q>=r.stop.q) return;
           var dx = STOPD[r.rid+'/'+x.id];
           if(dx==null || dx<=r.bd || dx>=r.dstop) return;
           gS.appendChild(el('circle',{cx:px(x.x).toFixed(1), cy:py(x.y).toFixed(1),
@@ -690,15 +735,15 @@
     }
 
     // 我站的這一根（或這幾根）站牌
-    entriesFor(stopName, dir).forEach(function(e){
+    currentEntries().forEach(function(e){
       gS.appendChild(el('circle',{cx:px(e.s.x).toFixed(1), cy:py(e.s.y).toFixed(1),
         r:(6*k).toFixed(2), class:'mystop', 'stroke-width':(2*k).toFixed(2)}));
     });
-    var first=entriesFor(stopName,dir)[0];
+    var first=currentEntries()[0];
     if(first){
       var t=el('text',{x:(px(first.s.x)+9*k).toFixed(1),
                        y:(py(first.s.y)-8*k).toFixed(1), class:'lbl'});
-      t.textContent=stopName; t.style.fontSize=(12*k).toFixed(1)+'px';
+      t.textContent=place.name; t.style.fontSize=(12*k).toFixed(1)+'px';
       t.style.strokeWidth=(3*k).toFixed(1)+'px'; gL.appendChild(t);
     }
 
@@ -724,7 +769,7 @@
         });
       });
     } else {
-      entriesFor(stopName, dir).forEach(function(e){ pts.push([e.s.x, e.s.y]); });
+      currentEntries().forEach(function(e){ pts.push([e.s.x, e.s.y]); });
       visibleRows().forEach(function(r){
         corridor(r).forEach(function(p){ pts.push(p); });
       });
@@ -762,16 +807,38 @@
   document.getElementById('zfit').onclick=function(){ userMoved=false; reframe(); drawMap(); };
 
   // ── 方向列 ────────────────────────────────────────────────────────────
-  var dirsBox=document.getElementById('dirs');
+  var dirsBox=document.getElementById('dirs'), placesBox=document.getElementById('places');
+  function drawPlaces(){
+    placesBox.textContent='';
+    var list=PLACES.slice();
+    if(!list.filter(function(x){ return x.name===place.name; }).length) list.push(place);
+    list.forEach(function(pl){
+      var b=document.createElement('button');
+      b.type='button'; b.textContent=pl.name;
+      b.setAttribute('aria-pressed', pl.name===place.name?'true':'false');
+      b.onclick=function(){
+        place=pl; plat=null; picked=null; userMoved=false;
+        try{ localStorage.setItem('busPlace', pl.name); }catch(e){}
+        render();
+      };
+      placesBox.appendChild(b);
+    });
+    var more=document.createElement('button');
+    more.type='button'; more.textContent='換站…';
+    more.setAttribute('aria-pressed','false');
+    more.onclick=function(){ q.value=''; drawOpts(); dlg.showModal(); q.focus(); };
+    placesBox.appendChild(more);
+  }
   function drawDirs(){
     dirsBox.textContent='';
-    var av=dirsAvailable(stopName);
-    if(av.indexOf(dir)<0 && av.length) dir=av[0];
-    av.forEach(function(g){
+    var ps=platforms();
+    if(!ps.length) return;
+    if(!ps.filter(function(o){ return o.L===String(plat); }).length) plat=ps[0].L;
+    ps.forEach(function(o){
       var b=document.createElement('button');
-      b.type='button'; b.textContent=dirLabel(stopName,g);
-      b.setAttribute('aria-pressed', g===dir?'true':'false');
-      b.onclick=function(){ dir=g; picked=null; userMoved=false; render(); };
+      b.type='button'; b.textContent=platLabel(o);
+      b.setAttribute('aria-pressed', o.L===String(plat)?'true':'false');
+      b.onclick=function(){ plat=o.L; picked=null; userMoved=false; render(); };
       dirsBox.appendChild(b);
     });
   }
@@ -790,15 +857,16 @@
       b.type='button'; b.className='opt';
       b.innerHTML='<span>'+n+'</span><span class="rs">'+Object.keys(rs).join('・')+'</span>';
       b.onclick=function(){
-        stopName=n; picked=null; userMoved=false;
-        try{ localStorage.setItem('busStop', n); }catch(e){}
+        var f = PLACES.filter(function(x){ return x.name===n; })[0];
+        place = f || {name:n, match:[n], routes:null, ntpc:[]};
+        plat=null; picked=null; userMoved=false;
+        try{ localStorage.setItem('busPlace', n); }catch(e){}
         dlg.close(); render();
       };
       opts.appendChild(b);
     });
     if(!names.length) opts.innerHTML='<p class="empty">找不到這個站名。</p>';
   }
-  document.getElementById('stopbtn').onclick=function(){ q.value=''; drawOpts(); dlg.showModal(); q.focus(); };
   document.getElementById('close').onclick=function(){ dlg.close(); };
   q.addEventListener('input', drawOpts);
 
@@ -814,7 +882,8 @@
   }
 
   function render(){
-    document.getElementById('stopname').textContent = stopName;
+    document.getElementById('stopname').textContent = place.name;
+    drawPlaces();
     drawDirs();
     computeRows();
     drawBoard();
@@ -900,7 +969,6 @@
   // ── 啟動 ──────────────────────────────────────────────────────────────
   buildGeometry();
   buildIndex();
-  if(!stopIndex[stopName]) stopName = HOME_STOP;
   render();
   start();
 })();

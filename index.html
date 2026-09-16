@@ -67,6 +67,9 @@
   /* ── main ───────────────────────────────────────────── */
   .shell{display:grid; grid-template-rows:auto 1fr; min-height:0; overflow:hidden}
   .shell.global{grid-template-rows:1fr}
+  /* 收起地圖時看板吃滿整個畫面 */
+  .shell.nomap{grid-template-rows:1fr}
+  .shell.nomap .mapwrap{display:none}
 
   .board{overflow-y:auto; background:var(--surface); border-bottom:1px solid var(--line)}
   .row{display:grid; grid-template-columns:auto 1fr auto; gap:12px; align-items:center;
@@ -197,6 +200,7 @@
       <button type="button" data-w="600" aria-pressed="false">10 分</button>
       <button type="button" data-w="0" aria-pressed="false">全部</button>
     </div>
+    <button type="button" class="btn" id="showmap" aria-pressed="false">顯示地圖</button>
     <button type="button" class="btn" id="mode" aria-pressed="false">看整條路線</button>
     <button type="button" class="btn" id="toggle" aria-pressed="true">自動更新中</button>
     <button type="button" class="btn" id="once">立刻更新</button>
@@ -239,10 +243,12 @@
   // —— 先前用瞬時速度堆疊是時間加權，會系統性偏慢。
   // 不排除站牌附近的點：實測（2026-09-16，307 去程）速度 0 的觀測與站牌距離
   // 中位 80m，有速度的 83m，兩者一樣，代表停滯不是靠站造成的。
-  // 格寬與窗口是拿覆蓋率換解析度的結果。改成一台車一票後樣本大幅變少，
-  // 實測（7 分鐘、尚未達窗口穩態）達標率：200m 格 13%、400m 格 44%、600m 格 75%。
-  // 取 400m＋30 分鐘窗口，解析度還夠用而且畫得出東西。
-  var JAM_BIN_M = 400, JAM_WIN_MIN = 30, JAM_MIN_N = 3;   // 至少要幾「台」車
+  // 格子用「地理網格＋行進方位」當鍵，不綁路線，所以跑同一條路的不同路線
+  // 會累積到同一格；對向車道方位不同，仍然分開統計。
+  // 方位取自路線線型在該點的走向，不用車輛回報的 Azimuth（停車時可能是 000）。
+  var CELL_LON = 0.004, CELL_LAT = 0.0036;   // 約 400m × 400m
+  var BRG_SECTORS = 8;                        // 方位切 8 象限（每 45 度）
+  var JAM_WIN_MIN = 30, JAM_MIN_N = 3;        // 窗口分鐘數／每格至少幾「台」車
   var JAM_KMH = 4, SLOW_KMH = 12;     // 低於 JAM 標紅，低於 SLOW 標橙
   var PASS_MIN_S = 20;                // 待滿這麼久才改用通過速度，之前先用回報瞬時值
 
@@ -277,15 +283,18 @@
   // 把一個點投影到路線上，回傳沿線里程 d 與離線距離 off
   function project(rid, g, lon, lat){
     var L = LINE[rid+'/'+g]; if(!L) return null;
-    var qx=mx(lon), qy=my(lat), P=L.P, C=L.C, bd=Infinity, bdist=0;
+    var qx=mx(lon), qy=my(lat), P=L.P, C=L.C, bd=Infinity, bdist=0, bbrg=0;
     for(var i=1;i<P.length;i++){
       var ax=P[i-1][0], ay=P[i-1][1], vx=P[i][0]-ax, vy=P[i][1]-ay;
       var L2=vx*vx+vy*vy, t = L2 ? ((qx-ax)*vx+(qy-ay)*vy)/L2 : 0;
       t = t<0?0:(t>1?1:t);
       var px_=ax+t*vx, py_=ay+t*vy, d=Math.hypot(qx-px_, qy-py_);
-      if(d<bd){ bd=d; bdist = C[i-1] + Math.hypot(px_-ax, py_-ay); }
+      if(d<bd){
+        bd=d; bdist = C[i-1] + Math.hypot(px_-ax, py_-ay);
+        bbrg = (Math.atan2(vx, vy)*180/Math.PI + 360) % 360;
+      }
     }
-    return {d:bdist, off:bd};
+    return {d:bdist, off:bd, brg:bbrg};
   }
 
   // ── 站牌索引（同名站牌可能分屬數個月台） ───────────────────────────────
@@ -303,6 +312,8 @@
   var stopName = HOME_STOP, dir = '0';
   var cur = null, etaMap = {}, history = [], rows = [], picked = null;
   var busTimer=null, etaTimer=null, running=true, failures=0, globalMode=false;
+  var showMap=false;
+  try{ showMap = localStorage.getItem('busShowMap')==='1'; }catch(e){}
 
   try{ var sv = localStorage.getItem('busStop'); if(sv) stopName = sv; }catch(e){}
 
@@ -363,9 +374,14 @@
   }
 
   // ── 路況探針：累積每個 200m 區段的公車速度 ─────────────────────────────
-  var probe = {};   // 'rid/g/bin' -> { 車號: {t0,d0,t,d,s} }，每台車一筆
+  function cellKey(lon, lat, brg){
+    var sect = ((Math.round(brg/(360/BRG_SECTORS)) % BRG_SECTORS) + BRG_SECTORS) % BRG_SECTORS;
+    return Math.floor(lon/CELL_LON)+':'+Math.floor(lat/CELL_LAT)+':'+sect;
+  }
+
+  var probe = {};   // cellKey -> { 車號: {t0,d0,t,d,s} }，每台車一筆
   try{
-    var raw = localStorage.getItem('busProbe3');
+    var raw = localStorage.getItem('busProbe4');
     if(raw){
       var o = JSON.parse(raw), cut = Date.now()/1000 - JAM_WIN_MIN*60;
       Object.keys(o).forEach(function(k){
@@ -386,7 +402,7 @@
       if(b.duty!=='1') return;
       var pr = project(b.r, b.g, b.x, b.y);
       if(!pr || pr.off > OFFLINE_M) return;
-      var k = b.r+'/'+b.g+'/'+Math.floor(pr.d/JAM_BIN_M);
+      var k = cellKey(b.x, b.y, pr.brg);
       var bin = probe[k] || (probe[k]={});
       var e = bin[b.b];
       // 同一台車在同一格只有一筆：第一次進來建立，之後就地更新，
@@ -403,7 +419,7 @@
     });
     if(now - probeSaveAt > 60){
       probeSaveAt = now;
-      try{ localStorage.setItem('busProbe3', JSON.stringify(probe)); }catch(e){}
+      try{ localStorage.setItem('busProbe4', JSON.stringify(probe)); }catch(e){}
     }
   }
   // 一台車通過這一格的速度：里程差÷時間差。待得不夠久就先用它回報的瞬時值。
@@ -412,8 +428,8 @@
     if(dt >= PASS_MIN_S) return Math.max(0, (e.d - e.d0)/dt*3.6);
     return e.s;
   }
-  function binSpeed(rid, g, bin){
-    var b = probe[rid+'/'+g+'/'+bin];
+  function cellSpeed(lon, lat, brg){
+    var b = probe[cellKey(lon, lat, brg)];
     if(!b) return null;
     var v = Object.keys(b).map(function(id){ return passSpeed(b[id]); });
     if(v.length < JAM_MIN_N) return null;
@@ -615,21 +631,25 @@
     return out;
   }
 
-  // 取出路廊上「慢」與「塞」的區段，供地圖上色與看板標示
+  // 沿著路廊逐段查地理格，把連續同狀態的段落合併成一條線
   function heat(r){
-    var g=String(dir), L=LINE[r.rid+'/'+g], pts=S.shapes[r.rid] && S.shapes[r.rid][g];
-    if(!L || !pts || r.bd==null) return [];
-    var out=[], b0=Math.floor(r.bd/JAM_BIN_M), b1=Math.floor(r.dstop/JAM_BIN_M);
-    for(var b=b0; b<=b1; b++){
-      var v=binSpeed(r.rid, g, b);
-      if(v==null || v>=SLOW_KMH) continue;
-      var lo=Math.max(b*JAM_BIN_M, r.bd), hi=Math.min((b+1)*JAM_BIN_M, r.dstop);
-      if(hi-lo < 20) continue;
-      var seg=[];
-      for(var i=0;i<pts.length;i++) if(L.C[i]>=lo && L.C[i]<=hi) seg.push(pts[i]);
-      if(seg.length<2) continue;
-      out.push({cls: v<JAM_KMH ? 'jam' : 'slow', pts:seg, kmh:v, len:hi-lo});
+    var pts = corridor(r);
+    if(pts.length < 2) return [];
+    var out = [], run = null;
+    for(var i=1;i<pts.length;i++){
+      var a=pts[i-1], b=pts[i];
+      var dx=mx(b[0])-mx(a[0]), dy=my(b[1])-my(a[1]), len=Math.hypot(dx,dy);
+      if(len < 1) continue;
+      var brg = (Math.atan2(dx, dy)*180/Math.PI + 360) % 360;
+      var v = cellSpeed((a[0]+b[0])/2, (a[1]+b[1])/2, brg);
+      var cls = (v==null || v>=SLOW_KMH) ? null : (v<JAM_KMH ? 'jam' : 'slow');
+      if(run && run.cls===cls){ run.pts.push(b); run.len += len; }
+      else {
+        if(run && run.cls) out.push(run);
+        run = {cls:cls, pts:[a,b], len:len};
+      }
     }
+    if(run && run.cls) out.push(run);
     return out;
   }
 
@@ -783,13 +803,26 @@
   q.addEventListener('input', drawOpts);
 
   // ── 主渲染 ────────────────────────────────────────────────────────────
+  function applyMapVisibility(){
+    var on = showMap || globalMode;
+    document.getElementById('shell').classList.toggle('nomap', !on);
+    var b=document.getElementById('showmap');
+    b.textContent = showMap ? '隱藏地圖' : '顯示地圖';
+    b.setAttribute('aria-pressed', showMap ? 'true':'false');
+    b.disabled = globalMode;
+    return on;
+  }
+
   function render(){
     document.getElementById('stopname').textContent = stopName;
     drawDirs();
     computeRows();
     drawBoard();
-    if(!userMoved) reframe();
-    drawMap();
+    var mapOn = applyMapVisibility();
+    if(mapOn){
+      if(!userMoved) reframe();
+      drawMap();
+    }
     document.getElementById('stamp').textContent = cur ? cur.u.slice(11) : '連線中…';
     var n = globalMode ? (cur?cur.bus.length:0) : rows.filter(function(r){ return r.bus; }).length;
     var jamN=0, slowN=0;
@@ -847,6 +880,11 @@
       picked=null; userMoved=false; render();
     };
   });
+  document.getElementById('showmap').onclick=function(){
+    showMap=!showMap; userMoved=false;
+    try{ localStorage.setItem('busShowMap', showMap?'1':'0'); }catch(e){}
+    render();
+  };
   document.getElementById('mode').onclick=function(){
     globalMode=!globalMode; picked=null; userMoved=false;
     this.setAttribute('aria-pressed', globalMode?'true':'false');

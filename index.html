@@ -64,10 +64,19 @@
   .dirs button[aria-pressed="true"]{background:var(--ink); color:var(--surface)}
 
   /* ── main ───────────────────────────────────────────── */
-  .shell{display:grid; grid-template-rows:auto 1fr; min-height:0; overflow:hidden}
-  .shell.global{grid-template-rows:1fr}
+  .shell{display:grid; grid-template-rows:auto auto 1fr; min-height:0; overflow:hidden}
+  .shell.global{grid-template-rows:0 0 1fr}
   /* 收起地圖時看板吃滿整個畫面 */
-  .shell.nomap{grid-template-rows:1fr}
+  .shell.nomap{grid-template-rows:auto 1fr 0}
+  .roadbar{display:flex; flex-wrap:wrap; gap:4px 10px; align-items:baseline;
+    padding:7px 16px; background:var(--surface-2); border-bottom:1px solid var(--line);
+    font-size:12px; color:var(--ink-2); font-variant-numeric:tabular-nums}
+  .roadbar .rt{font-family:"Barlow Condensed",sans-serif; font-weight:600;
+    font-size:13.5px; color:var(--ink)}
+  .roadbar b{font-weight:600}
+  .roadbar b.j{color:var(--bad)}
+  .roadbar b.s{color:var(--signal)}
+  .roadbar .rm{margin-left:auto; color:var(--ink-3); font-size:11px}
   .shell.nomap .mapwrap{display:none}
 
   .board{overflow-y:auto; background:var(--surface); border-bottom:1px solid var(--line)}
@@ -93,6 +102,7 @@
   .flags{display:flex; gap:5px; flex-wrap:wrap; margin-top:4px}
   .row .veh .flag{margin-left:5px}
   .flag.warn{color:var(--signal)}
+  .row .flag.warn{color:var(--signal)}
   .flag.stall{color:var(--bad)}
   .empty{padding:22px 16px; color:var(--ink-3); font-size:13px}
   .row.missing{opacity:.55}
@@ -182,6 +192,7 @@
   </header>
 
   <main class="shell" id="shell">
+    <div class="roadbar" id="roadbar" hidden></div>
     <section class="board" id="board"></section>
     <section class="mapwrap">
       <svg id="map" role="img" aria-label="站牌與來車位置圖"></svg>
@@ -200,6 +211,7 @@
       <button type="button" data-w="600" aria-pressed="false">10 分</button>
       <button type="button" data-w="0" aria-pressed="false">全部</button>
     </div>
+    <button type="button" class="btn" id="showroad" aria-pressed="true">路況</button>
     <button type="button" class="btn" id="showmap" aria-pressed="false">顯示地圖</button>
     <button type="button" class="btn" id="mode" aria-pressed="false">看整條路線</button>
     <button type="button" class="btn" id="toggle" aria-pressed="true">自動更新中</button>
@@ -257,7 +269,10 @@
   var CELL_LON = 0.004, CELL_LAT = 0.0036;   // 約 400m × 400m
   var BRG_SECTORS = 8;                        // 方位切 8 象限（每 45 度）
   var JAM_WIN_MIN = 30, JAM_MIN_N = 3;        // 窗口分鐘數／每格至少幾「台」車
-  var JAM_KMH = 4, SLOW_KMH = 12;     // 低於 JAM 標紅，低於 SLOW 標橙
+  // 命名刻意保守：探針量到的是「公車在這段路跑多慢」，其中混著紅燈。
+  // 靠站造成的停滯已用資料排除（速度 0 的觀測離站牌中位 80m、有速度的 83m），
+  // 但紅燈與壅塞無法分離，所以一律稱「低速／停滯」，不稱「壅塞」。
+  var JAM_KMH = 4, SLOW_KMH = 12;     // <4 判停滯、<12 判低速
   var PASS_MIN_S = 20;                // 待滿這麼久才改用通過速度，之前先用回報瞬時值
 
   var S = JSON.parse(document.getElementById('staticData').textContent);
@@ -320,8 +335,11 @@
   var place = PLACES[0], plat = null;
   var cur = null, etaMap = {}, history = [], rows = [], picked = null;
   var busTimer=null, etaTimer=null, running=true, failures=0, globalMode=false;
-  var showMap=false;
-  try{ showMap = localStorage.getItem('busShowMap')==='1'; }catch(e){}
+  var showMap=false, showRoad=true;
+  try{
+    showMap  = localStorage.getItem('busShowMap')==='1';
+    showRoad = localStorage.getItem('busShowRoad')!=='0';   // 預設開，可整組關掉做對照
+  }catch(e){}
 
   try{
     var sv = localStorage.getItem('busPlace');
@@ -458,13 +476,19 @@
     if(dt >= PASS_MIN_S) return Math.max(0, (e.d - e.d0)/dt*3.6);
     return e.s;
   }
-  function cellSpeed(lon, lat, brg){
+  function cellInfo(lon, lat, brg){
     var b = probe[cellKey(lon, lat, brg)];
     if(!b) return null;
-    var v = Object.keys(b).map(function(id){ return passSpeed(b[id]); });
-    if(v.length < JAM_MIN_N) return null;
-    v.sort(function(x,y){ return x-y; });
-    return v[Math.floor(v.length/2)];
+    var ids = Object.keys(b);
+    if(ids.length < JAM_MIN_N) return null;
+    var v = ids.map(function(id){ return passSpeed(b[id]); }).sort(function(x,y){ return x-y; });
+    var oldest = Math.min.apply(null, ids.map(function(id){ return b[id].t; }));
+    return {kmh: v[Math.floor(v.length/2)], n: ids.length,
+            age: Date.now()/1000 - oldest};
+  }
+  function cellSpeed(lon, lat, brg){
+    var o = cellInfo(lon, lat, brg);
+    return o ? o.kmh : null;
   }
 
   // ── 核心：這一站下一班是誰、在哪 ──────────────────────────────────────
@@ -504,7 +528,7 @@
         if(b.r!==rid || b.g!==g || b.duty!=='1') return;
         var pr = project(rid, g, b.x, b.y);
         if(!pr || pr.off > OFFLINE_M || pr.d >= dstop) return;
-        ups.push({bus:b, d:pr.d, gap:dstop-pr.d});
+        ups.push({bus:b, d:pr.d, gap:dstop-pr.d, brg:pr.brg});
       });
       ups.sort(function(a,b){ return a.gap-b.gap; });
 
@@ -543,7 +567,8 @@
         });
         rows.push({rid:rid, stop:s, g:g, bus:u.bus, busId:u.bus.b, gap:u.gap, bd:u.d, dstop:dstop,
                    eta:t, src:src, nleft:nleft, order:i, upstream:ups.length,
-                   calibrated:calibrated, stall:stalledFor(u.bus.b)});
+                   calibrated:calibrated, stall:stalledFor(u.bus.b),
+                   cellKmh: cellSpeed(u.bus.x, u.bus.y, u.brg)});
       });
     });
 
@@ -568,6 +593,59 @@
   // ── 畫面：看板 ────────────────────────────────────────────────────────
   var NEG = {'-1':'未發車','-2':'不停靠','-3':'末班已過','-4':'今日未營運'};
   var boardBox=document.getElementById('board');
+
+  // 路況摘要：只針對「下一班」那台車的路廊算一次。
+  // 不做跨路線合併——不同路線只共享部分路廊，之後會分岔，掛在月台層會誤導。
+  var ROAD_BACK_M = 2000;   // 摘要固定看站牌前這段距離，與車目前在哪無關
+  function roadSummary(){
+    var r = rows.filter(function(x){ return x.bus; })[0];
+    if(!r) return null;
+    // 用固定回看距離，而不是「到最近那台車」——後者在車快到站時會縮成幾百公尺，
+    // 摘要就變成一片無資料，講不出任何東西。
+    var L = LINE[r.rid+'/'+r.g], shp = S.shapes[r.rid] && S.shapes[r.rid][r.g];
+    if(!L || !shp) return null;
+    var lo = Math.max(0, r.dstop - ROAD_BACK_M), pts=[];
+    for(var k=0;k<shp.length;k++) if(L.C[k]>=lo && L.C[k]<=r.dstop) pts.push(shp[k]);
+    pts.push([r.stop.x, r.stop.y]);
+    if(pts.length < 2) return null;
+    var t = {jam:0, slow:0, clear:0, nodata:0}, total=0, age=0;
+    for(var i=1;i<pts.length;i++){
+      var a=pts[i-1], b=pts[i];
+      var dx=mx(b[0])-mx(a[0]), dy=my(b[1])-my(a[1]), len=Math.hypot(dx,dy);
+      if(len<1) continue;
+      var brg=(Math.atan2(dx,dy)*180/Math.PI+360)%360;
+      var o=cellInfo((a[0]+b[0])/2, (a[1]+b[1])/2, brg);
+      total+=len;
+      if(!o){ t.nodata+=len; continue; }
+      if(o.age>age) age=o.age;
+      if(o.kmh<JAM_KMH) t.jam+=len; else if(o.kmh<SLOW_KMH) t.slow+=len; else t.clear+=len;
+    }
+    return {name:S.meta[r.rid].name, total:total, t:t, age:age,
+            cover: total>0 ? 1-t.nodata/total : 0};
+  }
+  var roadBar=document.getElementById('roadbar');
+  function drawRoad(){
+    if(!showRoad || globalMode){ roadBar.hidden=true; return; }
+    var q=roadSummary();
+    if(!q || q.total<200){ roadBar.hidden=true; return; }
+    roadBar.hidden=false;
+    var km=function(m){ return m>=1000 ? (m/1000).toFixed(1)+' km' : Math.round(m)+' m'; };
+    var bits=[];
+    if(q.t.jam>0)  bits.push('<b class="j">停滯 '+km(q.t.jam)+'</b>');
+    if(q.t.slow>0) bits.push('<b class="s">低速 '+km(q.t.slow)+'</b>');
+    if(q.t.clear>0) bits.push('順暢 '+km(q.t.clear));
+    if(q.t.nodata>0) bits.push('無資料 '+km(q.t.nodata));
+    // 覆蓋率太低就別假裝知道路況
+    if(q.cover < 0.4){
+      roadBar.innerHTML = '<span class="rt">'+q.name+' 進站前 '+km(q.total)+'</span>'
+        + '路況樣本不足（已量到 '+Math.round(q.cover*100)+'%）'
+        + '<span class="rm">開著累積幾分鐘會補上</span>';
+      return;
+    }
+    roadBar.innerHTML = '<span class="rt">'+q.name+' 進站前 '+km(q.total)+'</span>'
+      + bits.join('・')
+      + '<span class="rm">量測 ≤'+Math.max(1,Math.round(q.age/60))+' 分鐘前・推估</span>';
+  }
 
   function drawBoard(){
     boardBox.textContent='';
@@ -596,16 +674,17 @@
       else if(v<=WINDOW_S||WINDOW_S===0){ txt=Math.round(v/60)+' 分'; cls+=' soon'; }
       else { txt=Math.round(v/60)+' 分'; }
 
-      var tag = (r.bus && r.src==='est') ? '<small>推估 ±1–2 分</small>' : '<small>官方</small>';
+      var tag = (r.bus && r.src==='est') ? '<small>推估</small>' : '<small>官方</small>';
 
       var mid;
       if(r.bus){
+        // 只講這台車自己的狀態。路段狀況是「路」的屬性，統一在上方摘要講一次，
+        // 不再逐列印累計長度——遠車路廊包含近車路廊，那個數字必然重複。
         var flags='';
         if(r.stall>=3) flags += '<span class="flag stall">停等 '+(r.stall*10)+' 秒</span>';
-        var jam = heat(r).filter(function(x){ return x.cls==='jam'; });
-        if(jam.length){
-          var jm = jam.reduce(function(a,x){ return a+x.len; },0);
-          flags += '<span class="flag stall">前方壅塞 '+Math.round(jm)+' m</span>';
+        if(showRoad && r.cellKmh!=null && r.cellKmh < SLOW_KMH){
+          flags += '<span class="flag '+(r.cellKmh<JAM_KMH?'stall':'warn')+'">正在'
+                 + (r.cellKmh<JAM_KMH?'停滯':'低速')+'路段 '+Math.round(r.cellKmh)+' km/h</span>';
         }
         mid = '<div class="veh">'+r.bus.b+'　'+r.bus.s+' km/h　'+Math.round(r.gap)+' m</div>'
             + '<div class="sub">還有 '+r.nleft+' 站　'
@@ -717,7 +796,7 @@
       // 站牌模式只畫「來車 → 你」這一段路廊，其餘路線不畫，避免整張圖都是線
       visibleRows().forEach(function(r){
         var seg = corridor(r); if(seg.length<2) return;
-        heat(r).forEach(function(h){
+        (showRoad ? heat(r) : []).forEach(function(h){
           var hd = h.pts.map(function(p,i){ return (i?'L':'M')+px(p[0]).toFixed(1)+' '+py(p[1]).toFixed(1); }).join('');
           gR.appendChild(el('path',{d:hd, class:'heat '+h.cls, 'stroke-width':(9*k).toFixed(2)}));
         });
@@ -886,6 +965,9 @@
     drawPlaces();
     drawDirs();
     computeRows();
+    var rb=document.getElementById('showroad');
+    rb.setAttribute('aria-pressed', showRoad?'true':'false');
+    drawRoad();
     drawBoard();
     var mapOn = applyMapVisibility();
     if(mapOn){
@@ -900,7 +982,7 @@
     });
     document.getElementById('chip').textContent = globalMode
       ? (n+' 輛在線（整條路線）')
-      : (n ? (n+' 台來車　路廊壅塞 '+jamN+' 段／緩慢 '+slowN+' 段') : '目前沒有可定位的來車');
+      : (n ? (n+' 台來車　停滯 '+jamN+' 段／低速 '+slowN+' 段') : '目前沒有可定位的來車');
   }
 
   // ── 連線 ──────────────────────────────────────────────────────────────
@@ -949,6 +1031,11 @@
       picked=null; userMoved=false; render();
     };
   });
+  document.getElementById('showroad').onclick=function(){
+    showRoad=!showRoad;
+    try{ localStorage.setItem('busShowRoad', showRoad?'1':'0'); }catch(e){}
+    render();
+  };
   document.getElementById('showmap').onclick=function(){
     showMap=!showMap; userMoved=false;
     try{ localStorage.setItem('busShowMap', showMap?'1':'0'); }catch(e){}
